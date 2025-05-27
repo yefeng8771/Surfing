@@ -267,3 +267,87 @@ TUN 模式允许 sing-box 创建一个虚拟网络接口，并接管设备的全
 
 配置 TUN 模式相对复杂，需要对网络和 sing-box 配置有较深入的理解。建议仔细阅读 sing-box 官方文档，并从小处着手，逐步验证配置。
 ---
+### 6.7 高级：当 sing-box TUN 的 `auto_route` 为 `true` 时
+
+本文档前面的部分（特别是6.4节）推荐在 sing-box 的 TUN 入站配置中设置 `"auto_route": false`，并依赖 Surfing 模块的脚本来管理系统级路由。这种方式通常能提供更好的一致性和可预测性。
+
+然而，部分高级用户可能希望利用 sing-box 自身强大的 `auto_route` 功能（当设置为 `true` 时），例如为了使用 sing-box 最新的路由/规则特性，或者在某些特定网络环境下 sing-box 的路由管理更为有效。
+
+如果您选择在 sing-box `config.json` 的 TUN 入站中设置 `"auto_route": true`，则**强烈建议您对 Surfing 模块的 `box_bll/scripts/box.service` 脚本进行相应的修改**，以避免与 sing-box 的路由管理发生冲突。
+
+**1. 理解冲突的根源**
+
+-   **sing-box `auto_route: true`**: sing-box 会主动配置系统路由表，例如将默认路由指向其创建的 TUN 接口，并可能添加其他规则以确保流量正确导入 TUN。它还会管理从 TUN 接口发出的流量如何路由到物理网络。
+-   **Surfing `box.service` 脚本**: `tun_forward_enable` 函数及其调用的 `tun_forward_ip_rules` 和 `sing_tun_ip_rules` 等函数，也会尝试配置系统 `ip rule` 和 `iptables` 规则，以引导流量进出 TUN 接口。
+
+当两者都尝试管理相同的路由资源时，可能导致：
+-   路由规则重复、冲突，优先级混乱。
+-   网络连接不稳定，部分应用无法上网，或出现意外的直连/代理行为。
+-   DNS 解析行为异常。
+
+**2. `box.service` 脚本的修改思路**
+
+核心思路是：**让 sing-box 主导路由，脚本只做辅助工作。**
+
+在 `box.service` 的 `tun_forward_enable` 函数中：
+
+-   **应保留的脚本功能：**
+    *   `tun_forward_disable()`: 在启动前清理所有旧规则仍然是好的做法。
+    *   `/proc/sys/net/ipv4/ip_forward` 的开启：确保系统允许 IP 转发。
+    *   `rp_filter` 的配置：这些是通用的系统网络参数。
+    *   `probe_tun_device()`: 检查 TUN 接口是否由 sing-box 成功创建。
+    *   `tun_forward_iptables_rules()`: 此函数主要配置 `iptables` 的 `FORWARD` 链规则（例如 `iptables -A FORWARD -i Meta -o <phy_if> -j ACCEPT`）。这些规则对于允许数据包在 TUN 接口和物理网络接口之间正确转发是必要的，尤其是在本机作为路由器（如热点）时。sing-box 的 `auto_route` 主要关注IP路由层面，`FORWARD` 链的防火墙规则通常需要单独配置。
+
+-   **应移除或大幅简化的脚本功能：**
+    *   **`tun_forward_ip_rules()` 函数内的所有 `ip rule add ...` 命令**:
+        这些规则（例如 `ip rule add from 10.0.0.0/8 lookup <some_table>` 或 `ip rule add iif Meta lookup main`）旨在将特定流量导向 TUN。当 `auto_route: true` 时，sing-box 会自行处理这些。脚本的这些规则很可能与之冲突。**建议全部移除 `tun_forward_ip_rules()` 的调用或将其内容清空/注释掉。**
+    *   **`sing_tun_ip_rules()` 函数内的所有 `ip rule add ...` 命令**:
+        这些规则（例如 `ip rule add from all iif Meta lookup main`）旨在处理从 TUN 接口发出的流量。sing-box 的 `auto_route` 应该已经确保了这些流量能正确到达物理出口。**建议全部移除 `sing_tun_ip_rules()` 的调用或将其内容清空/注释掉。**
+
+**3. 概念性的简化版 `tun_forward_enable` 函数示例 (当 `auto_route: true`)**
+
+```sh
+# 这是 box.service 中 tun_forward_enable 函数的一个概念性修改示例
+# 仅适用于 sing-box TUN 入站设置了 "auto_route": true 的情况
+
+tun_forward_enable_for_singbox_auto_route_true() {
+  tun_forward_disable # 清理旧规则
+
+  sleep 1
+  echo 1 > /proc/sys/net/ipv4/ip_forward # 确保 IP 转发开启
+  # 根据实际系统路径调整 rp_filter 配置
+  [ -e /proc/sys/net/ipv4/conf/all/rp_filter ] && echo 2 > /proc/sys/net/ipv4/conf/all/rp_filter
+  [ -e /proc/sys/net/ipv4/conf/default/rp_filter ] && echo 2 > /proc/sys/net/ipv4/conf/default/rp_filter
+  # 对于 IPv6 也应考虑相应设置，如果 IPv6 TUN 启用
+
+  if probe_tun_device; then # 检查 sing-box 是否已创建 TUN 设备
+    # 只保留必要的 iptables FORWARD 规则
+    tun_forward_iptables_rules "-I" # "-I" 表示插入规则到链首
+    log Info "TUN forwarding support enabled. Routing primarily managed by sing-box (auto_route=true)."
+    log Info "Surfing script only configured essential FORWARD rules."
+  else
+    log Error "TUN device ($tun_device) not found. Cannot enable TUN forwarding support."
+    return 1
+  fi
+  return 0
+}
+```
+**注意**: 上述脚本仅为示例，实际修改前请务必备份原脚本，并仔细理解每条命令的含义。您需要将 `tun_forward_enable` 的原始调用替换为此修改后的函数调用，或者直接修改原函数内容。
+
+**4. 对 `box.tproxy` 脚本的考量**
+
+在 `start.sh` 脚本中，通常会调用 `${scripts_dir}/box.tproxy enable`。此脚本用于根据 `box.config` 中的 `proxy_method` (如 TPROXY, REDIRECT) 设置 iptables 规则来拦截流量。
+
+如果 sing-box TUN 的 `auto_route: true` 旨在通过路由全面接管流量，那么 `box.tproxy` 中的大部分（甚至全部）基于特定端口的 `DNAT`、`REDIRECT` 或 `TPROXY` 目标规则也应该被禁用或移除。否则，流量可能在到达 TUN 接口（由路由引导）之前就被这些 iptables 规则提前拦截和处理，导致行为混乱。
+
+**5. 重要提示与风险**
+
+-   **高级操作**: 修改这些底层脚本属于高级操作，需要您对 Linux 网络路由、iptables 以及 sing-box 的 `auto_route` 机制有深入的理解。
+-   **备份**: 在进行任何修改前，务必备份 `/data/adb/box_bll/scripts/box.service` 和 `/data/adb/box_bll/scripts/box.tproxy` 文件。
+-   **测试**: 修改后必须进行彻底测试，包括本机各种应用的联网、热点分享功能、DNS 解析是否符合预期、有无流量泄漏等。
+-   **sing-box 配置**: 当 `auto_route: true` 时，务必在 sing-box 的全局 `route` 配置中正确设置 `auto_detect_interface: true` (或 `default_interface` / `default_mark`)，以避免 sing-box 自身出站流量被错误地路由回 TUN 接口导致循环。同时，DNS 配置也更为关键。
+-   **模块更新**: Surfing 模块更新时，这些自定义修改可能会被覆盖，需要重新应用。
+
+**结论**:
+虽然让 sing-box 的 `auto_route: true` 接管路由可以发挥 sing-box 更全面的路由能力，但这要求用户对整个流量路径和两个系统的交互有清晰的认识，并愿意承担修改和调试脚本的风险。对于大多数用户，遵循文档先前推荐的 `auto_route: false` 并依赖 Surfing 脚本管理路由，可能是更稳妥的选择。
+---
