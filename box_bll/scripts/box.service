@@ -297,15 +297,68 @@ tun_forward_iptables_rules() {
 }
 
 tun_forward_enable() {
-  tun_forward_disable
-  sleep 1
-  echo 1 > /proc/sys/net/ipv4/ip_forward
-  echo 2 > /proc/sys/net/ipv4/conf/default/rp_filter
-  echo 2 > /proc/sys/net/ipv4/conf/all/rp_filter
+  tun_forward_disable # Clean up previous rules first
 
-  probe_tun_index && tun_forward_ip_rules "add"
-  probe_tun_device && tun_forward_iptables_rules "-I" && sing_tun_ip_rules "add" && log Info "Tun 热点支持已启用."
-  return 0
+  # Common system settings needed for TUN operations
+  log Info "Enabling basic system settings for TUN..."
+  echo 1 > /proc/sys/net/ipv4/ip_forward
+  # Configure rp_filter (adjust paths if necessary for broader compatibility)
+  if [ -e /proc/sys/net/ipv4/conf/all/rp_filter ]; then
+    echo 2 > /proc/sys/net/ipv4/conf/all/rp_filter
+  else
+    log Warn "/proc/sys/net/ipv4/conf/all/rp_filter not found."
+  fi
+  if [ -e /proc/sys/net/ipv4/conf/default/rp_filter ]; then
+    echo 2 > /proc/sys/net/ipv4/conf/default/rp_filter
+  else
+    log Warn "/proc/sys/net/ipv4/conf/default/rp_filter not found."
+  fi
+  
+  # Optional: Enable IPv6 forwarding if the module intends to support it more broadly
+  # if [ -e /proc/sys/net/ipv6/conf/all/forwarding ]; then
+  #   echo 1 > /proc/sys/net/ipv6/conf/all/forwarding
+  #   log Info "IPv6 forwarding enabled."
+  # fi
+
+  # Check the user's preference for TUN routing management
+  # Default to "false" if the variable is not set or empty
+  local current_tun_preference="${SURFING_TUN_MODE_PREFERS_SINGBOX_ROUTING:-false}"
+
+  if [ "$current_tun_preference" = "true" ]; then
+    log Info "SURFING_TUN_MODE_PREFERS_SINGBOX_ROUTING=true. Applying minimal Surfing script rules for sing-box TUN."
+    log Info "This mode assumes sing-box 'auto_route:true' is managing main routing."
+
+    if probe_tun_device; then # Check if TUN device (e.g., "Meta") is up
+      tun_forward_iptables_rules "-I" # Add essential iptables FORWARD rules
+      log Info "Minimal TUN forwarding support enabled (iptables FORWARD rules applied by Surfing script)."
+    else
+      log Error "TUN device ($tun_device) not found. Cannot apply minimal TUN forwarding rules."
+      return 1 # Indicate failure
+    fi
+  else
+    log Info "SURFING_TUN_MODE_PREFERS_SINGBOX_ROUTING=false (or not set). Applying comprehensive Surfing script TUN rules."
+    
+    # This is the original logic block for when Surfing scripts manage routing
+    if ! probe_tun_device; then
+      log Error "TUN device ($tun_device) not found. Cannot apply comprehensive TUN forwarding rules."
+      return 1 # Indicate failure
+    fi
+
+    # Apply IP rules for LAN/hotspot if custom table index is found
+    if probe_tun_index; then
+      tun_forward_ip_rules "add"
+    else
+      log Warn "TUN routing table index for '$tun_device' not found. LAN routing rules via custom table skipped."
+      # Consider if any fallback basic IP rules are needed here if custom table is not used.
+      # For now, matches original behavior of skipping if probe_tun_index fails.
+    fi
+    
+    tun_forward_iptables_rules "-I" # Add iptables FORWARD rules
+    sing_tun_ip_rules "add"         # Add IP rules for traffic originating from/to TUN (Surfing managed)
+
+    log Info "Comprehensive TUN forwarding support enabled (Surfing scripts manage routing)."
+  fi
+  return 0 # Indicate success
 }
 
 tun_forward_disable() {

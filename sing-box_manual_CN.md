@@ -114,240 +114,178 @@ Surfing 模块通过 `box.service` 脚本管理核心服务的生命周期。
 
 本文档基于对 Surfing 模块脚本的分析创建。具体行为可能随模块版本更新而有所变化。建议同时参考模块的官方 README 和 sing-box 官方文档。
 
-## 6. 配置 TUN 模式
+## 6. 配置 TUN 模式 (重要更新)
 
-TUN 模式允许 sing-box 创建一个虚拟网络接口，并接管设备的全部（或部分）网络流量（包括 TCP 和 UDP），实现系统级的透明代理。
+TUN 模式允许 sing-box 创建一个虚拟网络接口，并接管设备的全部（或部分）网络流量（包括 TCP 和 UDP），实现系统级的透明代理。**此部分已更新，引入了一个新的配置选项来更好地管理 Surfing 脚本与 sing-box 自身路由功能的交互。**
 
 ### 6.1 TUN 模式简介
 - **功能**: 通过创建名为 `tun_device` (在 `box.config` 中定义，默认为 "Meta") 的虚拟网卡，sing-box 可以捕获所有流向该网卡的网络流量，并根据其内部配置进行处理和转发。
-- **优势**: 相比 TProxy 或 Redirect 模式，TUN 模式通常能更全面地处理所有应用的各种协议流量，并且在路由控制上可以更为精细。对于需要代理 UDP 流量或希望全局代理的场景非常有用。
-- **Surfing 模块支持**: Surfing 模块的脚本 (`box.service`) 包含用于配置系统路由和防火墙规则以配合 TUN 设备工作的函数 (`tun_forward_enable`, `tun_forward_disable`, `sing_tun_ip_rules`)。这些脚本旨在将系统流量导向由 sing-box 创建的 TUN 接口。
+- **优势**: 相比 TProxy 或 Redirect 模式，TUN 模式通常能更全面地处理所有应用的各种协议流量，并且在路由控制上可以更为精细。
+- **Surfing 模块支持**: `box.service` 脚本包含用于配置系统路由和防火墙规则以配合 TUN 设备工作的函数。通过新的配置变量，您可以选择是由 Surfing 脚本主要管理路由，还是让 sing-box (通过其 `auto_route: true` 设置) 主要管理路由。
 
 ### 6.2 Surfing 模块中的 TUN 配置 (`box.config`)
-确保 `box_bll/scripts/box.config` 中的以下参数配置正确：
-- `tun_device="Meta"`: 这是 sing-box 创建的 TUN 接口名称，**必须与 sing-box `config.json` 中 TUN 入站设置的 `interface_name` 完全一致**。
-- `proxy_method`: 虽然 Surfing 模块提供了 `TPROXY`, `REDIRECT`, `MIXED` 等选项，但在纯 sing-box TUN 模式下，主要依赖 sing-box 自身的 TUN 配置。Surfing 脚本中的 TUN 相关路由规则 (`tun_forward_enable`等) 会在服务启动时应用。
 
-**注意**: `README_CN.md` 中曾提及 TUN 模式 "v7.4.3 弃用"。虽然相关脚本函数依然存在，用户在配置较新版本的 Surfing 模块时应留意此信息，并进行充分测试。
+#### 6.2.1 `tun_device`
+- `tun_device="Meta"`: 定义了 sing-box 创建的 TUN 接口名称。**此名称必须与您的 sing-box `config.json` 中 TUN 入站设置的 `interface_name` 完全一致。**
 
-### 6.3 sing-box `config.json` 中的 TUN 入站配置
-用户**必须自行配置** sing-box 的 `config.json` 文件以启用 TUN 入站。以下是一个 TUN 入站配置示例：
+#### 6.2.2 (新增) `SURFING_TUN_MODE_PREFERS_SINGBOX_ROUTING` (手动添加)
+为了更灵活地控制 TUN 模式下的路由管理方式，引入了一个新的配置变量。由于工具限制，**您需要手动将以下代码块添加到您的 `/data/adb/box_bll/scripts/box.config` 文件中**，通常可以放在文件末尾：
+
+```sh
+# -------------------------
+# TUN Mode Advanced Settings
+# -------------------------
+# SURFING_TUN_MODE_PREFERS_SINGBOX_ROUTING:
+# This setting determines how Surfing scripts interact with sing-box's own
+# TUN routing capabilities (specifically the "auto_route" option in sing-box's
+# TUN inbound configuration).
+#
+# Set to "true" IF:
+#   1. You are using sing-box as the core.
+#   2. You have configured "auto_route": true in your sing-box
+#      TUN inbound settings (e.g., in /data/adb/box_bll/sing-box/config.json).
+#   3. You want sing-box to primarily manage system routes for the TUN interface.
+#   In this "true" case, Surfing scripts will apply minimal system routing rules
+#   (IP forwarding, rp_filter, essential iptables FORWARD rules)
+#   to avoid conflicts with sing-box.
+#
+# Set to "false" (or leave undefined/commented out) IF:
+#   1. You prefer Surfing scripts to manage system routes for the TUN interface.
+#   2. You have set "auto_route": false in your sing-box TUN inbound configuration.
+#   This is the default behavior and is generally recommended unless you are an
+#   advanced user and understand the implications of sing-box's auto_route.
+#
+SURFING_TUN_MODE_PREFERS_SINGBOX_ROUTING="false"
+```
+**`box.service` 脚本会读取此变量的值来决定其 TUN 路由配置策略。**
+
+#### 6.2.3 `proxy_method` 与 `box.tproxy` 的影响
+- `proxy_method` (例如 TPROXY, REDIRECT): 此设置主要影响 `box.tproxy` 脚本的行为，该脚本负责设置 iptables 规则来拦截流量。
+- **重要**: 如果您将 `SURFING_TUN_MODE_PREFERS_SINGBOX_ROUTING` 设置为 `"true"` (即 sing-box 主导路由)，强烈建议您检查 `box.tproxy` 的行为。理想情况下，当 sing-box TUN 通过路由全面接管流量时，`box.tproxy` 不应再添加可能冲突的 iptables 拦截规则 (如 DNAT 或 TPROXY 规则)。
+    - 您可能需要将 `proxy_method` 设置为一个能让 `box.tproxy` 添加最少规则的模式。
+    - 高级用户可能需要手动注释掉 `box.tproxy` 脚本中的部分规则生成代码，以避免冲突。未来版本的 Surfing 模块可能会更好地集成此场景。
+
+**注意**: `README_CN.md` 中曾提及 TUN 模式 "v7.4.3 弃用"。虽然相关脚本函数依然存在并已更新，用户在配置时仍应留意此信息，并进行充分测试。
+
+### 6.3 sing-box `config.json` 中的 TUN 配置
+
+用户**必须自行配置** sing-box 的 `config.json` 文件以启用 TUN 入站。以下是配置示例，展示了两种主要场景。
+
+#### 6.3.1 场景 A: Surfing 脚本主导路由 (推荐，默认)
+   - 在 `box.config` 中设置 `SURFING_TUN_MODE_PREFERS_SINGBOX_ROUTING="false"` (或未设置此变量)。
+   - 在 sing-box `config.json` 的 TUN inbound 中设置 `"auto_route": false`。
 
 ```json
 {
+  // ... (全局 log, dns, outbounds, route 等配置保持不变，参考 6.3.3)
   "inbounds": [
     {
       "type": "tun",
-      "tag": "tun-in", // 自定义标签
-      "interface_name": "Meta", // !!关键!! 必须与 box.config 中的 tun_device 一致
-      "address": [ // TUN 接口在 sing-box 内的 IP 地址
-        "10.0.1.1/24",  // IPv4 地址，避免与局域网冲突
-        "fd00:10:0:1::1/64" // IPv6 ULA 地址 (可选)
-      ],
-      "mtu": 1500, // 通常为 1500
-      "stack": "system", // 在 Android/Linux 上通常使用 "system" 或 "mixed"
-      "auto_route": false, // 推荐设置为 false，由 Surfing 脚本管理系统路由
-                           // 如果设置为 true，需在全局 "route" 配置中设置 "auto_detect_interface": true 或 "default_interface" 避免回环
-      "strict_route": true, // 配合 auto_route:true 时，建议开启以防泄漏 (若 auto_route:false，此项影响不大)
-      "sniff": true, // 开启流量嗅探以识别协议，配合路由规则使用
-      "sniff_override_destination": false, // 根据嗅探结果决定真实目标地址
-
-      // TUN 入站的 DNS 设置 (可选，通常依赖全局 DNS 配置)
-      // "dns": {
-      //   "servers": [
-      //     { "address": "1.1.1.1" }
-      //   ]
-      // }
+      "tag": "tun-in",
+      "interface_name": "Meta", // !!与 box.config 中的 tun_device 一致
+      "address": [ "10.0.1.1/24", "fd00:10:0:1::1/64" ],
+      "mtu": 1500,
+      "stack": "system",
+      "auto_route": false, // !!关键!! Surfing 脚本负责路由
+      "strict_route": false, // auto_route 为 false 时，此项通常也为 false
+      "sniff": true,
+      "sniff_override_destination": false
+      // TUN 入站的 DNS 设置通常可以省略，依赖全局 DNS
     }
-    // ... 其他入站配置 (如果有)
-  ],
+  ]
+  // ... (全局 dns, outbounds, route 等配置，确保它们能正确处理来自 TUN 的流量)
+}
+```
 
-  "dns": { // 全局 DNS 配置 (TUN 模式下至关重要)
-    "servers": [
-      {
-        "tag": "remote-dns",
-        "address": "8.8.8.8", // 主要的上游 DNS
-        "detour": "direct" // 通过直连出站解析
-      },
-      {
-        "tag": "local-dns", // 可选：本地 DNS，用于特定域名
-        "address": "223.5.5.5",
-        "detour": "direct"
-      }
-      // 如果需要 DNS over HTTPS 或其他安全 DNS，请按 sing-box 文档配置
-    ],
-    "rules": [ // DNS 规则示例
-      // { "domain_suffix": [".cn", "aliyuncs.com"], "server": "local-dns" },
-      { "outbound": "any", "server": "remote-dns" } // 默认所有查询走 remote-dns
-    ],
-    "strategy": "prefer_ipv4", // 或 "ipv4_only", "ipv6_only"
-    "disable_cache": false,
-    // "fakeip": { // FakeIP 模式在 TUN 下可以简化规则，但需仔细配置
-    //   "enabled": true,
-    //   "inet4_range": "198.18.0.0/15"
-    //   // "inet6_range": "fc00::/7" // 如果需要 IPv6 FakeIP
-    // }
-  },
+#### 6.3.2 场景 B: sing-box 主导路由 (高级)
+   - 在 `box.config` 中**手动添加并设置** `SURFING_TUN_MODE_PREFERS_SINGBOX_ROUTING="true"`。
+   - 在 sing-box `config.json` 的 TUN inbound 中设置 `"auto_route": true`。
+   - **同时，必须在 sing-box 全局 `route` 配置中设置 `"auto_detect_interface": true` 或 `"default_interface"`** (指向实际物理网卡的出站) 以避免流量回环。
 
-  "outbounds": [
+```json
+{
+  // ... (全局 log, dns, outbounds 等配置保持不变，参考 6.3.3)
+  "inbounds": [
     {
-      "tag": "proxy-out", // 代理出站的标签
-      "type": "your_proxy_protocol", // 例如: shadowsocks, vmess, trojan 等
-      // ... 具体的代理服务器配置
-    },
-    {
-      "tag": "direct",
-      "type": "direct"
-    },
-    {
-      "tag": "block",
-      "type": "block"
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "Meta", // !!与 box.config 中的 tun_device 一致
+      "address": [ "10.0.1.1/24", "fd00:10:0:1::1/64" ],
+      "mtu": 1500,
+      "stack": "system",
+      "auto_route": true, // !!关键!! sing-box 负责主要路由
+      "strict_route": true, // 配合 auto_route:true 时，建议开启
+      "sniff": true,
+      "sniff_override_destination": false
+      // TUN 入站的 DNS 设置通常可以省略，依赖全局 DNS
     }
   ],
-
   "route": { // 全局路由规则
-    // "auto_detect_interface": true, // 若 TUN 入站中 auto_route:true，则必须开启此项或设置 default_interface
+    "auto_detect_interface": true, // !!关键!! 防止流量回环 当 TUN auto_route:true
+    // 或者 "default_interface": "wlan0", // 根据实际物理网卡名称
     "rules": [
-      // 示例规则：阻止 QUIC (可选)
-      // { "protocol": "quic", "outbound": "block" },
-      // 示例规则：局域网地址直连
-      { "ip_cidr": ["192.168.0.0/16", "10.0.0.0/8", "172.16.0.0/12"], "outbound": "direct" },
-      { "domain_suffix": ["local", "lan"], "outbound": "direct"},
-      // 示例规则：特定应用流量直连 (需要 sniffer 和 Android specific settings in TUN inbound)
-      // { "package_name": ["com.android.browser"], "outbound": "direct" },
-      // 默认规则：所有其他 TCP 和 UDP 流量都通过代理出站
-      { "network": "tcp,udp", "outbound": "proxy-out" }
+      // ...您的路由规则...
+      { "ip_cidr": ["192.168.0.0/16", "10.0.0.0/8"], "outbound": "direct" },
+      { "network": "tcp,udp", "outbound": "proxy-out" } // "proxy-out" 是您的代理出站tag
     ],
-    "final": "proxy-out" // 最后的默认出站
+    "final": "proxy-out"
   }
+  // ... (其他全局 dns, outbounds 等配置)
 }
 ```
 
-### 6.4 关键配置说明
-- **`interface_name`**: **极其重要**。必须与 `box_bll/scripts/box.config` 中定义的 `tun_device`（默认为 "Meta"）完全一致。Surfing 模块的脚本会根据 `tun_device` 的名称来配置系统路由。
-- **`address`**: TUN 接口在 sing-box 内部使用的 IP 地址和子网掩码。例如 `10.0.1.1/24`。这个 IP 地址不应与您的物理局域网IP冲突。它是系统路由表将流量导向 sing-box 的目标。
-- **`stack`**: 推荐使用 `"system"`。
-- **`auto_route` (TUN 入站内)**:
-    - 当设置为 `true` 时，sing-box 会尝试自动配置系统路由表，将所有流量导向 TUN 接口。此时，您**必须**在全局 `route` 部分配置 `auto_detect_interface: true` 或 `default_interface` (指向您的实际物理网卡出站) 来防止 sing-box 自身的出站流量被重新导回 TUN 接口，造成循环。
-    - 鉴于 Surfing 模块的 `box.service` 脚本本身包含了详细的 `ip rule` 和 `iptables` 配置逻辑 (`tun_forward_enable` 函数)，**建议将 sing-box TUN 入站中的 `auto_route` 设置为 `false`**。这样可以避免与 Surfing 脚本的路由配置发生冲突，由 Surfing 脚本全权负责系统级路由。sing-box 仅负责处理进入 "Meta" 接口的流量。
-- **全局 DNS 配置 (`dns` 部分)**:
-    - 在 TUN 模式下，所有（或大部分）DNS 请求会被导向 TUN 接口并由 sing-box 处理。因此，必须配置 sing-box 的全局 DNS 解析。
-    - 您可以配置 sing-box 将 DNS 请求通过代理服务器转发，或直接请求公共 DNS 服务器。
-    - FakeIP (`fakeip` 选项) 是一种高级 DNS 技术，可以将域名解析为特定范围内的假 IP 地址，可以简化透明代理的路由规则，但需要用户更深入的理解。
-- **全局路由配置 (`route` 部分)**:
-    - 定义了 sing-box 如何处理通过 TUN 接口接收到的流量。例如，哪些流量直连（如局域网流量），哪些通过代理出站。
-    - 如果 TUN 入站中的 `auto_route` 设置为 `false`（推荐做法），则全局路由规则主要负责将 TUN 接收到的流量正确导向出站（如 `proxy-out` 或 `direct`）。
+#### 6.3.3 通用的全局 DNS 和 Outbounds 示例 (配合上述任一场景)
+```json
+{
+  // ... (inbounds 配置如上)
+  "log": {
+    "level": "info",
+    "output": "/data/adb/box_bll/sing-box/sing-box.log",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      { "tag": "remote-dns", "address": "8.8.8.8", "detour": "direct" },
+      { "tag": "local-dns", "address": "223.5.5.5", "detour": "direct" }
+    ],
+    "rules": [ { "outbound": "any", "server": "remote-dns" } ],
+    "strategy": "prefer_ipv4",
+    "disable_cache": false
+  },
+  "outbounds": [
+    { "tag": "proxy-out", "type": "your_proxy_protocol", "server": "...", "server_port": 0 /* ... */ },
+    { "tag": "direct", "type": "direct" },
+    { "tag": "block", "type": "block" }
+  ]
+  // route 部分已在场景 B 中单独列出，对于场景 A，也需要类似的 route 配置，
+  // 但不需要 auto_detect_interface 或 default_interface (因为 TUN auto_route:false)
+}
+```
 
-### 6.5 Surfing 脚本与 TUN 的交互
+### 6.4 Surfing 脚本与 TUN 的交互 (根据新逻辑)
+
 - 当 `box.service start` 被调用且 sing-box 核心启动成功（并创建了名为 `tun_device` 的接口）后，`tun_forward_enable` 函数会被执行。
-- 此函数会：
-    1. 清理旧的 TUN 相关路由和防火墙规则。
-    2. 开启 IPv4 转发 (`/proc/sys/net/ipv4/ip_forward`)。
-    3. 配置 `rp_filter`。
-    4. 使用 `ip rule` 添加多条路由规则，这些规则通常用于将特定流量（如来自局域网的流量或发往特定子网的流量）导向一个特定的路由表，或直接通过 TUN 设备。
-    5. 使用 `iptables` (和 `ip6tables`) 添加 `FORWARD` 规则，允许流量在物理接口和 TUN 接口之间转发。
-- `tun_forward_disable` 函数则负责在服务停止时移除这些规则。
+- **如果 `SURFING_TUN_MODE_PREFERS_SINGBOX_ROUTING` 为 `"false"` (默认):**
+    - `box.service` 会执行其传统的、较全面的路由和 iptables FORWARD 规则配置，包括调用 `tun_forward_ip_rules` 和 `sing_tun_ip_rules`。
+    - 您应在 sing-box `config.json` 中设置 `auto_route: false`。
+- **如果 `SURFING_TUN_MODE_PREFERS_SINGBOX_ROUTING` 为 `"true"`:**
+    - `box.service` 会执行简化的路由配置：仅确保 IP 转发开启、`rp_filter` 配置正确，并调用 `tun_forward_iptables_rules` 来添加必要的 `iptables FORWARD` 规则。它不会添加详细的 `ip rule` 规则。
+    - 您应在 sing-box `config.json` 中设置 `auto_route: true`，并配置好 `route.auto_detect_interface` 或 `route.default_interface`。
 
-### 6.6 TUN 模式故障排查
-1. **检查 `interface_name`**: 确保 `config.json` 中的 `interface_name` 与 `box.config` 中的 `tun_device` 完全一致。
-2. **检查 sing-box 日志**:
-    - 查看 `/data/adb/box_bll/run/check.log`（配置检查日志）。
-    - 查看 `/data/adb/box_bll/run/error_sing-box.log`（运行时错误）。
-    - 查看您在 `config.json` 中为 sing-box 配置的主日志文件，获取详细的 TUN 接口创建和流量处理信息。
-3. **检查 TUN 接口状态**:
-    - sing-box 启动后，使用 `ifconfig` 或 `ip addr` 命令查看名为 `Meta` (或您自定义的 `tun_device` 名称) 的网络接口是否存在，以及其 IP 地址是否与 `config.json` 中配置的一致。
-4. **检查系统路由规则**:
-    - 使用 `ip rule list` 查看路由策略。
-    - 使用 `ip route list table <table_index>` (如果 Surfing 脚本使用了特定路由表) 查看具体路由表。
-    - 重点关注是否有规则将流量导向 `Meta` 设备。
-5. **检查 iptables 规则**:
-    - 使用 `iptables -L -v -n` 和 `iptables -t nat -L -v -n` 查看是否有相关的 `FORWARD` 或 `NAT` 规则。
-6. **DNS 解析**: 确认 DNS 是否能正常解析。可以使用 `ping` 或 `nslookup` 测试。错误的 DNS 配置是 TUN 模式下网络不通的常见原因。
-7. **`auto_route` 设置**: 如果遇到路由问题或与 Surfing 脚本冲突，尝试将 sing-box TUN 入站中的 `auto_route` 设置为 `false`，并依赖 Surfing 脚本进行路由管理。
+### 6.5 TUN 模式故障排查 (通用)
+1. **确认 `SURFING_TUN_MODE_PREFERS_SINGBOX_ROUTING` 设置**: 检查您在 `box.config` 中（手动添加的）此变量的值是否符合您的预期场景。
+2. **检查 `interface_name` 与 `tun_device`**: 确保 sing-box `config.json` 中的 `interface_name` 与 `box.config` 中的 `tun_device` 完全一致 (默认为 "Meta")。
+3. **检查 sing-box 日志**: 查看 `/data/adb/box_bll/run/check.log`，`/data/adb/box_bll/run/error_sing-box.log`，以及您在 `config.json` 中配置的主日志文件。
+4. **检查 TUN 接口状态**: 使用 `ifconfig` 或 `ip addr` 查看 "Meta" (或自定义名称) TUN 接口是否存在及 IP 配置。
+5. **检查系统路由和规则**:
+    - `ip rule list`
+    - `ip route list table all` (查看所有路由表)
+    - `iptables -L -v -n` 和 `iptables -t nat -L -v -n`
+    - 根据您选择的模式，判断路由和 iptables 规则是否符合预期（是由脚本设置还是由 sing-box 设置）。
+6. **DNS 解析**: 使用 `ping` 或 `nslookup` 测试。错误的 DNS 配置是常见问题。确保 sing-box 的 DNS 配置能正常工作。
+7. **sing-box `auto_route: true` 时的特定检查**:
+    - 确保 `route.auto_detect_interface: true` 或 `route.default_interface` 已在 sing-box `config.json` 中正确设置，以防流量回环。
+    - 检查是否有其他程序（如 `box.tproxy` 的残留规则）干扰了 sing-box 的路由。
 
-配置 TUN 模式相对复杂，需要对网络和 sing-box 配置有较深入的理解。建议仔细阅读 sing-box 官方文档，并从小处着手，逐步验证配置。
----
-### 6.7 高级：当 sing-box TUN 的 `auto_route` 为 `true` 时
-
-本文档前面的部分（特别是6.4节）推荐在 sing-box 的 TUN 入站配置中设置 `"auto_route": false`，并依赖 Surfing 模块的脚本来管理系统级路由。这种方式通常能提供更好的一致性和可预测性。
-
-然而，部分高级用户可能希望利用 sing-box 自身强大的 `auto_route` 功能（当设置为 `true` 时），例如为了使用 sing-box 最新的路由/规则特性，或者在某些特定网络环境下 sing-box 的路由管理更为有效。
-
-如果您选择在 sing-box `config.json` 的 TUN 入站中设置 `"auto_route": true`，则**强烈建议您对 Surfing 模块的 `box_bll/scripts/box.service` 脚本进行相应的修改**，以避免与 sing-box 的路由管理发生冲突。
-
-**1. 理解冲突的根源**
-
--   **sing-box `auto_route: true`**: sing-box 会主动配置系统路由表，例如将默认路由指向其创建的 TUN 接口，并可能添加其他规则以确保流量正确导入 TUN。它还会管理从 TUN 接口发出的流量如何路由到物理网络。
--   **Surfing `box.service` 脚本**: `tun_forward_enable` 函数及其调用的 `tun_forward_ip_rules` 和 `sing_tun_ip_rules` 等函数，也会尝试配置系统 `ip rule` 和 `iptables` 规则，以引导流量进出 TUN 接口。
-
-当两者都尝试管理相同的路由资源时，可能导致：
--   路由规则重复、冲突，优先级混乱。
--   网络连接不稳定，部分应用无法上网，或出现意外的直连/代理行为。
--   DNS 解析行为异常。
-
-**2. `box.service` 脚本的修改思路**
-
-核心思路是：**让 sing-box 主导路由，脚本只做辅助工作。**
-
-在 `box.service` 的 `tun_forward_enable` 函数中：
-
--   **应保留的脚本功能：**
-    *   `tun_forward_disable()`: 在启动前清理所有旧规则仍然是好的做法。
-    *   `/proc/sys/net/ipv4/ip_forward` 的开启：确保系统允许 IP 转发。
-    *   `rp_filter` 的配置：这些是通用的系统网络参数。
-    *   `probe_tun_device()`: 检查 TUN 接口是否由 sing-box 成功创建。
-    *   `tun_forward_iptables_rules()`: 此函数主要配置 `iptables` 的 `FORWARD` 链规则（例如 `iptables -A FORWARD -i Meta -o <phy_if> -j ACCEPT`）。这些规则对于允许数据包在 TUN 接口和物理网络接口之间正确转发是必要的，尤其是在本机作为路由器（如热点）时。sing-box 的 `auto_route` 主要关注IP路由层面，`FORWARD` 链的防火墙规则通常需要单独配置。
-
--   **应移除或大幅简化的脚本功能：**
-    *   **`tun_forward_ip_rules()` 函数内的所有 `ip rule add ...` 命令**:
-        这些规则（例如 `ip rule add from 10.0.0.0/8 lookup <some_table>` 或 `ip rule add iif Meta lookup main`）旨在将特定流量导向 TUN。当 `auto_route: true` 时，sing-box 会自行处理这些。脚本的这些规则很可能与之冲突。**建议全部移除 `tun_forward_ip_rules()` 的调用或将其内容清空/注释掉。**
-    *   **`sing_tun_ip_rules()` 函数内的所有 `ip rule add ...` 命令**:
-        这些规则（例如 `ip rule add from all iif Meta lookup main`）旨在处理从 TUN 接口发出的流量。sing-box 的 `auto_route` 应该已经确保了这些流量能正确到达物理出口。**建议全部移除 `sing_tun_ip_rules()` 的调用或将其内容清空/注释掉。**
-
-**3. 概念性的简化版 `tun_forward_enable` 函数示例 (当 `auto_route: true`)**
-
-```sh
-# 这是 box.service 中 tun_forward_enable 函数的一个概念性修改示例
-# 仅适用于 sing-box TUN 入站设置了 "auto_route": true 的情况
-
-tun_forward_enable_for_singbox_auto_route_true() {
-  tun_forward_disable # 清理旧规则
-
-  sleep 1
-  echo 1 > /proc/sys/net/ipv4/ip_forward # 确保 IP 转发开启
-  # 根据实际系统路径调整 rp_filter 配置
-  [ -e /proc/sys/net/ipv4/conf/all/rp_filter ] && echo 2 > /proc/sys/net/ipv4/conf/all/rp_filter
-  [ -e /proc/sys/net/ipv4/conf/default/rp_filter ] && echo 2 > /proc/sys/net/ipv4/conf/default/rp_filter
-  # 对于 IPv6 也应考虑相应设置，如果 IPv6 TUN 启用
-
-  if probe_tun_device; then # 检查 sing-box 是否已创建 TUN 设备
-    # 只保留必要的 iptables FORWARD 规则
-    tun_forward_iptables_rules "-I" # "-I" 表示插入规则到链首
-    log Info "TUN forwarding support enabled. Routing primarily managed by sing-box (auto_route=true)."
-    log Info "Surfing script only configured essential FORWARD rules."
-  else
-    log Error "TUN device ($tun_device) not found. Cannot enable TUN forwarding support."
-    return 1
-  fi
-  return 0
-}
-```
-**注意**: 上述脚本仅为示例，实际修改前请务必备份原脚本，并仔细理解每条命令的含义。您需要将 `tun_forward_enable` 的原始调用替换为此修改后的函数调用，或者直接修改原函数内容。
-
-**4. 对 `box.tproxy` 脚本的考量**
-
-在 `start.sh` 脚本中，通常会调用 `${scripts_dir}/box.tproxy enable`。此脚本用于根据 `box.config` 中的 `proxy_method` (如 TPROXY, REDIRECT) 设置 iptables 规则来拦截流量。
-
-如果 sing-box TUN 的 `auto_route: true` 旨在通过路由全面接管流量，那么 `box.tproxy` 中的大部分（甚至全部）基于特定端口的 `DNAT`、`REDIRECT` 或 `TPROXY` 目标规则也应该被禁用或移除。否则，流量可能在到达 TUN 接口（由路由引导）之前就被这些 iptables 规则提前拦截和处理，导致行为混乱。
-
-**5. 重要提示与风险**
-
--   **高级操作**: 修改这些底层脚本属于高级操作，需要您对 Linux 网络路由、iptables 以及 sing-box 的 `auto_route` 机制有深入的理解。
--   **备份**: 在进行任何修改前，务必备份 `/data/adb/box_bll/scripts/box.service` 和 `/data/adb/box_bll/scripts/box.tproxy` 文件。
--   **测试**: 修改后必须进行彻底测试，包括本机各种应用的联网、热点分享功能、DNS 解析是否符合预期、有无流量泄漏等。
--   **sing-box 配置**: 当 `auto_route: true` 时，务必在 sing-box 的全局 `route` 配置中正确设置 `auto_detect_interface: true` (或 `default_interface` / `default_mark`)，以避免 sing-box 自身出站流量被错误地路由回 TUN 接口导致循环。同时，DNS 配置也更为关键。
--   **模块更新**: Surfing 模块更新时，这些自定义修改可能会被覆盖，需要重新应用。
-
-**结论**:
-虽然让 sing-box 的 `auto_route: true` 接管路由可以发挥 sing-box 更全面的路由能力，但这要求用户对整个流量路径和两个系统的交互有清晰的认识，并愿意承担修改和调试脚本的风险。对于大多数用户，遵循文档先前推荐的 `auto_route: false` 并依赖 Surfing 脚本管理路由，可能是更稳妥的选择。
+配置 TUN 模式相对复杂，建议仔细阅读 sing-box 官方文档，并从小处着手，逐步验证配置。
 ---
